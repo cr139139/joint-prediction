@@ -12,10 +12,16 @@ from datasets import ArticulatedDataset
 from model import JointPrediction
 from losses import degree_error_distance, origin_error_distance
 
+import numpy as np
+from visdom import Visdom
+
+vis = Visdom()
+line = vis.line(np.arange(10))
+
 parser = argparse.ArgumentParser()
 parser.add_argument('--workers', type=int, help='number of data loading workers', default=4)
-parser.add_argument('--nepoch', type=int, default=200, help='number of epochs to train for')
-parser.add_argument('--weight', type=str, default='weights', help='trained weight folder')
+parser.add_argument('--nepoch', type=int, default=400, help='number of epochs to train for')
+parser.add_argument('--weight', type=str, default='../data/weights', help='trained weight folder')
 parser.add_argument('--model', type=str, default='', help='model path')
 
 opt = parser.parse_args()
@@ -28,9 +34,9 @@ torch.manual_seed(opt.manualSeed)
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-train_dataset = ArticulatedDataset("./cabinet_train_1K/scenes/")
+train_dataset = ArticulatedDataset("../data/cabinet_train_1K/scenes/")
 train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=1, shuffle=True)
-valid_dataset = ArticulatedDataset('./cabinet_val_50/scenes/')
+valid_dataset = ArticulatedDataset('../data/cabinet_val_50/scenes/')
 valid_dataloader = torch.utils.data.DataLoader(valid_dataset, batch_size=1, shuffle=False)
 print(len(train_dataset), len(valid_dataset))
 
@@ -43,118 +49,143 @@ except OSError:
 model = JointPrediction()
 if opt.model != '':
     model.load_state_dict(torch.load(opt.model))
-optimizer = optim.Adam(model.parameters(), lr=1e-3)
-scheduler = optim.lr_scheduler.LambdaLR(optimizer=optimizer, lr_lambda=lambda epoch: 0.95 ** epoch)
+optimizer = optim.Adam(model.parameters(), lr=1e-4)
+scheduler = optim.lr_scheduler.LambdaLR(optimizer=optimizer, lr_lambda=lambda epoch: 0.99 ** epoch)
 model.to(device)
 
-num_batch = len(train_dataset)
+num_train_dataset = len(train_dataset)
+num_valid_dataset = len(valid_dataset)
 batch_size = 25
 
-typeloss = torch.nn.BCELoss()
-mseloss = torch.nn.MSELoss()
-typeloss.to(device)
-mseloss.to(device)
+seg_distance = torch.nn.BCEWithLogitsLoss(pos_weight=torch.tensor(4.88))
+type_distance = torch.nn.BCELoss()
+mse_distance = torch.nn.MSELoss()
+seg_distance.to(device)
+type_distance.to(device)
+mse_distance.to(device)
 
 start_time = time.time()
 time_loss = []
-valid_loss = 10000
+best_valid_loss = 10000
 
 for epoch in range(opt.nepoch):
-    sum_loss = 0
-    sum_step = 0
+    train_sum_loss = 0
+    train_sum_step = 0
     valid_sum_loss = 0
     valid_sum_step = 0
-    type_correctness = 0
+    train_segment_correctness = 0
+    valid_segment_correctness = 0
+    train_type_correctness = 0
+    valid_type_correctness = 0
 
     # training steps
     for i, data in enumerate(train_dataloader, 0):
-        pc_start, pc_end, joint_type, joint_screw = data
-        pc_start, pc_end, joint_type, joint_screw = pc_start.to(device), pc_end.to(device), \
-                                                    joint_type.to(device), joint_screw.to(device)
+        pc_start, pc_end, pc_seg_start, joint_type, joint_screw = data
+        pc_start, pc_end, pc_seg_start, joint_type, joint_screw = pc_start.to(device), pc_end.to(device), \
+                                                                  pc_seg_start.to(device), \
+                                                                  joint_type.to(device), joint_screw.to(device)
 
         # optimizer.zero_grad()
         model = model.train()
-        prediction = model(pc_start, pc_end)
+        segment_pred, joint_pred = model(pc_start, pc_end)
 
         # calculate losses
-        type_loss = typeloss(prediction[0, :1], joint_type)
-
+        segment_loss = seg_distance(segment_pred, pc_seg_start)
+        type_loss = type_distance(joint_pred[0, :1], joint_type)
         if joint_type < 0.5:
-            screw_orientation_loss = degree_error_distance(prediction[:, 1:4], joint_screw[:, :3])
-            screw_origin_loss = mseloss(prediction[:, 4:7], joint_screw[:, 3:]) \
-                                + origin_error_distance(prediction[:, 1:4], prediction[:, 4:7],
-                                                        joint_screw[:, :3], joint_screw[:, 3:])
-
+            orientation_loss = degree_error_distance(joint_pred[:, 1:4], joint_screw[:, :3])
+            origin_loss = mse_distance(joint_pred[:, 4:7], joint_screw[:, 3:]) \
+                          + origin_error_distance(joint_pred[:, 1:4], joint_pred[:, 4:7],
+                                                  joint_screw[:, :3], joint_screw[:, 3:])
         else:
-            screw_orientation_loss = degree_error_distance(prediction[:, 7:], joint_screw[:, :3])
-            screw_origin_loss = 0
+            orientation_loss = degree_error_distance(joint_pred[:, 7:], joint_screw[:, :3])
+            origin_loss = 0
 
-        if (prediction[0, :1] >= 0.5).int() == joint_type:
-            type_correctness += 1
-        loss = (type_loss + screw_orientation_loss + screw_origin_loss) / batch_size
+        loss = (segment_loss + type_loss + orientation_loss + origin_loss) / batch_size
         loss.backward()
+
+        if (joint_pred[0, :1] >= 0.5).int() == joint_type:
+            train_type_correctness += 1
+
+        correctness_sum = torch.sum(((segment_pred >= 0.5).int() == pc_seg_start.int()).int())
+        train_segment_correctness += correctness_sum / pc_start.size()[2]
 
         if i % batch_size == batch_size - 1:
             torch.nn.utils.clip_grad_norm_(model.parameters(), 0.001)
             optimizer.step()
             optimizer.zero_grad()
-            print('[%d: %4d/%d] train loss: %.3f, type loss: %.3f, axis loss: %.3f, origin loss: %.3f type accuracy: '
-                  '%.2f'
-                  % (epoch, i + 1, num_batch, loss.item(), type_loss, screw_orientation_loss, screw_origin_loss,
-                     type_correctness / batch_size))
+            print('[%d: %4d/%4d] train loss: %.3f (seg: %.3f, type: %.3f, ori: %.3f, orig: %.3f, seg acc: %.2f, '
+                  'type acc: %.2f) '
+                  % (epoch, i + 1, num_train_dataset, loss.item(), segment_loss, type_loss, orientation_loss,
+                     origin_loss, train_segment_correctness / batch_size, train_type_correctness / batch_size))
 
-            type_correctness = 0
+            train_segment_correctness = 0
+            train_type_correctness = 0
 
         # store training loss and step
-        sum_loss += loss.item() * pc_start.size(0)
-        sum_step += pc_start.size(0)
-
-    type_correctness = 0
+        train_sum_loss += loss.item() * pc_start.size(0) * batch_size
+        train_sum_step += pc_start.size(0)
 
     # validation steps
     for i, data in enumerate(valid_dataloader, 0):
-        pc_start, pc_end, joint_type, joint_screw = data
-        pc_start, pc_end, joint_type, joint_screw = pc_start.to(device), pc_end.to(device), \
-                                                    joint_type.to(device), joint_screw.to(device)
+        pc_start, pc_end, pc_seg_start, joint_type, joint_screw = data
+        pc_start, pc_end, pc_seg_start, joint_type, joint_screw = pc_start.to(device), pc_end.to(device), \
+                                                                  pc_seg_start.to(device), \
+                                                                  joint_type.to(device), joint_screw.to(device)
 
         model = model.eval()
-        prediction = model(pc_start, pc_end)
+        segment_pred, joint_pred = model(pc_start, pc_end)
 
         # calculate losses
-        type_loss = typeloss(prediction[0, :1], joint_type)
-
+        segment_loss = seg_distance(segment_pred, pc_seg_start)
+        type_loss = type_distance(joint_pred[0, :1], joint_type)
         if joint_type < 0.5:
-            screw_orientation_loss = degree_error_distance(prediction[:, 1:4], joint_screw[:, :3])
-            screw_origin_loss = mseloss(prediction[:, 4:7], joint_screw[:, 3:]) \
-                                + origin_error_distance(prediction[:, 1:4], prediction[:, 4:7],
-                                                        joint_screw[:, :3], joint_screw[:, 3:])
-
+            orientation_loss = degree_error_distance(joint_pred[:, 1:4], joint_screw[:, :3])
+            origin_loss = mse_distance(joint_pred[:, 4:7], joint_screw[:, 3:]) \
+                          + origin_error_distance(joint_pred[:, 1:4], joint_pred[:, 4:7],
+                                                  joint_screw[:, :3], joint_screw[:, 3:])
         else:
-            screw_orientation_loss = degree_error_distance(prediction[:, 7:], joint_screw[:, :3])
-            screw_origin_loss = 0
+            orientation_loss = degree_error_distance(joint_pred[:, 7:], joint_screw[:, :3])
+            origin_loss = 0
 
-        if (prediction[0, :1] >= 0.5).int() == joint_type:
-            type_correctness += 1
+        if (joint_pred[0, :1] >= 0.5).int() == joint_type:
+            valid_type_correctness += 1
 
-        loss = (type_loss + screw_orientation_loss + screw_origin_loss)
+        correctness_sum = torch.sum(((segment_pred >= 0.5).int() == pc_seg_start.int()).int())
+        valid_segment_correctness += correctness_sum / pc_start.size()[2]
+
+        loss = (segment_loss + type_loss + orientation_loss + origin_loss)
 
         # store validation loss and step
         valid_sum_loss += loss.item() * pc_start.size(0)
         valid_sum_step += pc_start.size(0)
 
-    new_valid_loss = valid_sum_loss / valid_sum_step
-
-    blue = lambda x: '\033[94m' + x + '\033[0m'
-    print('[%d: 0/0] %s loss: %f type accuracy: %.2f' % (epoch, blue('valid'), new_valid_loss, type_correctness / 50))
+        blue = lambda x: '\033[94m' + x + '\033[0m'
+        if i + 1 != num_valid_dataset:
+            print_end = '\r'
+        else:
+            print_end = '\n'
+        print('[%d: %4d/%4d] %s loss: %.3f (seg: %.3f, type: %.3f, ori: %.3f, orig: %.3f, seg acc: %.2f, type acc: '
+              '%.2f) '
+              % (epoch, i + 1, num_valid_dataset, blue('valid'), valid_sum_loss / valid_sum_step,
+                 segment_loss, type_loss, orientation_loss, origin_loss, valid_segment_correctness / valid_sum_step,
+                 valid_type_correctness / valid_sum_step),
+              end=print_end)
 
     # save a weight with lowest loss
-    if valid_loss > new_valid_loss:
-        valid_loss = new_valid_loss
-        torch.save(model.state_dict(), '%s/model_valid_best.pth' % opt.weight)
+    if best_valid_loss > valid_sum_loss / valid_sum_step:
+        best_valid_loss = valid_sum_loss / valid_sum_step
+        torch.save(model.state_dict(), '%s/model_best_valid.pth' % opt.weight)
 
-    torch.save(model.state_dict(), '%s/model_last.pth' % opt.weight)
+    torch.save(model.state_dict(), '%s/model_last_train.pth' % opt.weight)
 
-    time_loss.append([time.time() - start_time, sum_loss / sum_step, new_valid_loss])
+    time_loss.append([time.time() - start_time, train_sum_loss / train_sum_step, valid_sum_loss / valid_sum_step])
+
+    time_loss_array = np.array(time_loss)
+    vis.line(X=time_loss_array[:, 0],
+             Y=time_loss_array[:, 1:],
+             win=line,
+             opts=dict(legend=["Train", "Valid"]))
 
     # reduce the learning rate after each epochs
     scheduler.step()
@@ -165,3 +196,4 @@ with open('loss_track.csv', 'w', newline='') as f:
 
     write.writerow(['time', 'train loss', 'valid loss'])
     write.writerows(time_loss)
+    f.close()
