@@ -190,7 +190,7 @@ for epoch in range(opt.nepoch):
     # reduce the learning rate after each epochs
     scheduler.step()
 
-with open('loss_track.csv', 'w', newline='') as f:
+with open('../data/loss_track.csv', 'w', newline='') as f:
     # using csv.writer method from CSV package
     write = csv.writer(f)
 
