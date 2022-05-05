@@ -15,14 +15,15 @@ from losses import degree_error_distance, origin_error_distance
 import numpy as np
 from visdom import Visdom
 
-vis = Visdom()
-line = vis.line(np.arange(10))
+# vis = Visdom()
+# line = vis.line(np.arange(10))
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--workers', type=int, help='number of data loading workers', default=4)
-parser.add_argument('--nepoch', type=int, default=400, help='number of epochs to train for')
+parser.add_argument('--nepoch', type=int, default=100, help='number of epochs to train for')
 parser.add_argument('--weight', type=str, default='../data/weights', help='trained weight folder')
-parser.add_argument('--model', type=str, default='', help='model path')
+parser.add_argument('--model', type=str, default='../data/weights/model_last_train.pth', help='model path')
+# parser.add_argument('--model', type=str, default='', help='model path')
 
 opt = parser.parse_args()
 print(opt)
@@ -34,9 +35,18 @@ torch.manual_seed(opt.manualSeed)
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-train_dataset = ArticulatedDataset("../data/cabinet_train_1K/scenes/")
+train_dataset_cabinet = ArticulatedDataset("../data/cabinet_train_1K/scenes/")
+train_dataset_faucet = ArticulatedDataset("../data/faucet_train_1K/scenes/")
+train_dataset_laptop = ArticulatedDataset("../data/laptop_train_1K/scenes/")
+train_dataset_oven = ArticulatedDataset("../data/oven_train_1K/scenes/")
+train_dataset = torch.utils.data.ConcatDataset([train_dataset_cabinet, train_dataset_faucet, train_dataset_laptop, train_dataset_oven])
 train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=1, shuffle=True)
-valid_dataset = ArticulatedDataset('../data/cabinet_val_50/scenes/')
+
+valid_dataset_cabinet = ArticulatedDataset('../data/cabinet_val_50/scenes/')
+valid_dataset_faucet = ArticulatedDataset('../data/faucet_val_50/scenes/')
+valid_dataset_laptop = ArticulatedDataset('../data/laptop_val_50/scenes/')
+valid_dataset_oven = ArticulatedDataset('../data/oven_val_50/scenes/')
+valid_dataset = torch.utils.data.ConcatDataset([valid_dataset_cabinet, valid_dataset_faucet, valid_dataset_laptop, valid_dataset_oven])
 valid_dataloader = torch.utils.data.DataLoader(valid_dataset, batch_size=1, shuffle=False)
 print(len(train_dataset), len(valid_dataset))
 
@@ -50,15 +60,15 @@ model = JointPrediction()
 if opt.model != '':
     model.load_state_dict(torch.load(opt.model))
 optimizer = optim.Adam(model.parameters(), lr=1e-4)
-scheduler = optim.lr_scheduler.LambdaLR(optimizer=optimizer, lr_lambda=lambda epoch: 0.99 ** epoch)
+scheduler = optim.lr_scheduler.LambdaLR(optimizer=optimizer, lr_lambda=lambda epoch: 0.97 ** epoch)
 model.to(device)
 
 num_train_dataset = len(train_dataset)
 num_valid_dataset = len(valid_dataset)
 batch_size = 25
 
-seg_distance = torch.nn.BCEWithLogitsLoss(pos_weight=torch.tensor(4.88))
-type_distance = torch.nn.BCELoss()
+seg_distance = torch.nn.BCEWithLogitsLoss(pos_weight=torch.tensor(3))
+type_distance = torch.nn.BCEWithLogitsLoss(pos_weight=torch.tensor(8))
 mse_distance = torch.nn.MSELoss()
 seg_distance.to(device)
 type_distance.to(device)
@@ -101,7 +111,8 @@ for epoch in range(opt.nepoch):
             orientation_loss = degree_error_distance(joint_pred[:, 7:], joint_screw[:, :3])
             origin_loss = 0
 
-        loss = (segment_loss + type_loss + orientation_loss + origin_loss) / batch_size
+        loss = (segment_loss + type_loss + orientation_loss * 5 + origin_loss * 10) / batch_size
+        # loss = (segment_loss) / batch_size
         loss.backward()
 
         if (joint_pred[0, :1] >= 0.5).int() == joint_type:
@@ -110,21 +121,21 @@ for epoch in range(opt.nepoch):
         correctness_sum = torch.sum(((segment_pred >= 0.5).int() == pc_seg_start.int()).int())
         train_segment_correctness += correctness_sum / pc_start.size()[2]
 
+        # store training loss and step
+        train_sum_loss += loss.item() * pc_start.size(0) * batch_size
+        train_sum_step += pc_start.size(0)
+
         if i % batch_size == batch_size - 1:
             torch.nn.utils.clip_grad_norm_(model.parameters(), 0.001)
             optimizer.step()
             optimizer.zero_grad()
             print('[%d: %4d/%4d] train loss: %.3f (seg: %.3f, type: %.3f, ori: %.3f, orig: %.3f, seg acc: %.2f, '
                   'type acc: %.2f) '
-                  % (epoch, i + 1, num_train_dataset, loss.item(), segment_loss, type_loss, orientation_loss,
+                  % (epoch, i + 1, num_train_dataset, train_sum_loss / train_sum_step, segment_loss, type_loss, orientation_loss,
                      origin_loss, train_segment_correctness / batch_size, train_type_correctness / batch_size))
 
             train_segment_correctness = 0
             train_type_correctness = 0
-
-        # store training loss and step
-        train_sum_loss += loss.item() * pc_start.size(0) * batch_size
-        train_sum_step += pc_start.size(0)
 
     # validation steps
     for i, data in enumerate(valid_dataloader, 0):
@@ -154,7 +165,8 @@ for epoch in range(opt.nepoch):
         correctness_sum = torch.sum(((segment_pred >= 0.5).int() == pc_seg_start.int()).int())
         valid_segment_correctness += correctness_sum / pc_start.size()[2]
 
-        loss = (segment_loss + type_loss + orientation_loss + origin_loss)
+        loss = (segment_loss + type_loss + orientation_loss * 5 + origin_loss * 10)
+        # loss = segment_loss
 
         # store validation loss and step
         valid_sum_loss += loss.item() * pc_start.size(0)
@@ -182,10 +194,10 @@ for epoch in range(opt.nepoch):
     time_loss.append([time.time() - start_time, train_sum_loss / train_sum_step, valid_sum_loss / valid_sum_step])
 
     time_loss_array = np.array(time_loss)
-    vis.line(X=time_loss_array[:, 0],
-             Y=time_loss_array[:, 1:],
-             win=line,
-             opts=dict(legend=["Train", "Valid"]))
+    # vis.line(X=time_loss_array[:, 0],
+    #          Y=time_loss_array[:, 1:],
+    #          win=line,
+    #          opts=dict(legend=["Train", "Valid"]))
 
     # reduce the learning rate after each epochs
     scheduler.step()

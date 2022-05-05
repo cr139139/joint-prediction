@@ -6,7 +6,7 @@ import torch.utils.data as data
 
 
 class ArticulatedDataset(data.Dataset):
-    def __init__(self, data_path, sample_num_points=16384):
+    def __init__(self, data_path, sample_num_points=16384//16):
         self.data_path = data_path
         self.ids = os.listdir(data_path)
         self.sample_num_points = sample_num_points
